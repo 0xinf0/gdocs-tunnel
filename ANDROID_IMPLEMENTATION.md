@@ -14,7 +14,7 @@ Android App → SOCKS5 (127.0.0.1:1080) → gdocs_tunnel binary → Google Docs 
 ## Binary Downloads
 
 Get the pre-built binaries from:
-https://github.com/0xinf0/gdocs-tunnel/releases/tag/v0.1.0
+https://github.com/0xinf0/gdocs-tunnel/releases/tag/v0.1.1
 
 | Architecture | File | Android ABI |
 |--------------|------|-------------|
@@ -164,6 +164,7 @@ Options:
 - Server port: `8080`
 - Server public key: `nWlaxQRHkjUr5zsZb86oCjifAcsX6mTvhFU0+LchpxM=`
 - User-Agent rotation (6 common browsers)
+- Google frontend IP rotation (22 Anycast IPs from 142.250.x.x, 142.251.x.x, 172.217.x.x, 173.194.x.x, 216.58.x.x, 74.125.x.x, 64.233.x.x)
 
 **Output:**
 ```
@@ -262,10 +263,20 @@ Common issues:
 
 ## Performance Notes
 
-- Latency: 200-500ms per request (due to Google Docs Viewer roundtrip)
-- Bandwidth: 10-50 KB/s effective throughput
-- Best for: Messaging, web browsing, low-bandwidth apps
-- Not ideal for: Video streaming, large downloads
+**Measured (real-world testing):**
+
+| Metric | Value |
+|--------|-------|
+| Google Docs RTT | ~500ms |
+| Session init | ~500ms |
+| TCP connect | ~500ms |
+| Full HTTPS request | 5-7 sec |
+| Throughput | 1-5 KB/s |
+| Server IPv6 pool | 2^64 IPs |
+| Client Google IPs | 22 IPs |
+
+**Best for:** Telegram, Signal, WhatsApp, email, low-bandwidth browsing
+**Not suitable for:** Video streaming, large downloads, real-time gaming
 
 ## Source Code Reference
 
@@ -276,6 +287,25 @@ Key files:
 - `src/bin/server.rs` - Server implementation
 - `README.md` - Full documentation
 
+## Rate Limit Evasion
+
+The binary uses dual IP rotation to avoid Google's rate limits:
+
+**Server-side (IPv6 rotation):**
+- Server has 2^64 addresses in its /64 prefix
+- Each request uses a random IPv6 from the pool
+- Google sees requests from different "servers"
+
+**Client-side (Google frontend rotation):**
+- Client rotates across 22 verified Google Anycast IPs
+- Each request goes to a different Google load balancer
+- Distributes rate limiting across Google's infrastructure
+
+**Combined effect:**
+- 22 client IPs × 2^64 server IPs = massive distribution
+- ~10 requests/minute sustainable per IP pair
+- With rotation: effectively unlimited throughput
+
 ## Security Notes
 
 - All traffic is encrypted with AES-256-GCM
@@ -283,6 +313,7 @@ Key files:
 - Each session uses ephemeral keys
 - Traffic appears as Google Docs Viewer requests
 - No identifying patterns in traffic
+- IP rotation makes traffic correlation difficult
 
 ---
 
