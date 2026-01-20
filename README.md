@@ -183,7 +183,8 @@ val process = ProcessBuilder(binary.absolutePath, "--port", "1080")
 - **AES-256-GCM encryption**: All tunnel traffic is authenticated and encrypted
 - **No logs**: Server doesn't log destination addresses
 - **Domain fronting**: Traffic appears as Google Docs requests
-- **IPv6 rotation**: Each request uses random IP from 2^64 address space
+- **Server IPv6 rotation**: Each request uses random IP from 2^64 address space
+- **Client IP rotation**: Rotates across 22 Google Anycast frontend IPs to distribute rate limits
 
 ## Protocol
 
@@ -230,10 +231,13 @@ Contains the client's ephemeral public key + AEAD tag, allowing the server to de
 | Full HTTPS request | 5-7 sec | Init + connect + TLS + data |
 | Throughput | 1-5 KB/s | Limited by Google RTT |
 | Server IPv6 pool | 2^64 | Avoids server-side rate limits |
+| Client Google IPs | 22 | Distributes client-side rate limits |
 
 **Rate Limiting:**
-- Google rate limits per client IP
-- ~10 requests/minute sustainable
+- Google rate limits per client IP and per destination server IP
+- Server-side: IPv6 rotation (2^64 addresses) prevents server rate limits
+- Client-side: Rotates across 22 Google Anycast IPs to distribute limits
+- ~10 requests/minute sustainable per IP pair
 - Bursts trigger "No document ID" errors
 - 100ms minimum delay between requests helps
 
