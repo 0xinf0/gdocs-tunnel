@@ -55,6 +55,51 @@ const USER_AGENTS: &[&str] = &[
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ];
 
+// ============= GOOGLE FRONTEND IP ROTATION =============
+// Verified working Google frontend IPs (Anycast - work globally)
+// These are actual IPs returned by DNS for www.google.com
+// Rotate to distribute rate limiting across Google's infrastructure
+const GOOGLE_FRONTEND_IPS: &[u32] = &[
+    // 142.250.x.x range
+    0x8EFA_B004,  // 142.250.176.4
+    0x8EFA_BCE4,  // 142.250.188.228
+    0x8EFA_4424,  // 142.250.68.36
+    0x8EFA_4444,  // 142.250.68.68
+    0x8EFA_48A4,  // 142.250.72.164
+    0x8EFA_4884,  // 142.250.72.132
+    0x8EFA_C464,  // 142.250.196.100
+    // 142.251.x.x range
+    0x8EFB_2864,  // 142.251.40.100
+    0x8EFB_2244,  // 142.251.34.68
+    // 172.217.x.x range
+    0xACD9_0C84,  // 172.217.12.132
+    0xACD9_0E64,  // 172.217.14.100
+    // 173.194.x.x range (frequently returned by DNS)
+    0xADC2_DB68,  // 173.194.219.104
+    0xADC2_DB67,  // 173.194.219.103
+    0xADC2_DB69,  // 173.194.219.105
+    0xADC2_DB93,  // 173.194.219.147
+    0xADC2_DB63,  // 173.194.219.99
+    0xADC2_DB6A,  // 173.194.219.106
+    // 216.58.x.x range
+    0xD83A_D2CE,  // 216.58.210.206
+    // 74.125.x.x range
+    0x4A7D_8A64,  // 74.125.138.100
+    0x4A7D_8A65,  // 74.125.138.101
+    // 64.233.x.x range
+    0x40E9_B963,  // 64.233.185.99
+    0x40E9_B964,  // 64.233.185.100
+];
+
+fn random_google_ip() -> std::net::Ipv4Addr {
+    use rand::seq::SliceRandom;
+    let ip = GOOGLE_FRONTEND_IPS
+        .choose(&mut rand::thread_rng())
+        .copied()
+        .unwrap_or(GOOGLE_FRONTEND_IPS[0]);
+    std::net::Ipv4Addr::from(ip)
+}
+
 // ============= IPv6 ROTATION =============
 #[derive(Clone)]
 struct Ipv6Prefix {
@@ -270,7 +315,7 @@ impl GoogleDocsTunnel {
         })
     }
 
-    /// Build HTTP client for domain fronting with random User-Agent
+    /// Build HTTP client for domain fronting with random User-Agent and random Google IP
     fn build_client(&self) -> Result<reqwest::Client> {
         use rand::seq::SliceRandom;
 
@@ -281,10 +326,22 @@ impl GoogleDocsTunnel {
         headers.insert(HOST, HeaderValue::from_static("docs.google.com"));
         headers.insert(USER_AGENT, HeaderValue::from_str(ua).unwrap());
 
+        // Pick random Google frontend IP to distribute rate limiting
+        let google_ip = random_google_ip();
+        let socket_addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(google_ip),
+            443,
+        );
+
+        debug!("Using Google frontend IP: {}", google_ip);
+
         reqwest::Client::builder()
             .default_headers(headers)
             .timeout(REQUEST_TIMEOUT)
             .http1_only()
+            // Override DNS: connect to random Google IP instead of resolving
+            .resolve("www.google.com", socket_addr)
+            .resolve("docs.google.com", socket_addr)
             .build()
             .context("Failed to build HTTP client")
     }
