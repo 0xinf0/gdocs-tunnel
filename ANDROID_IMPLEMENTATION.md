@@ -283,3 +283,342 @@ Key files:
 - Each session uses ephemeral keys
 - Traffic appears as Google Docs Viewer requests
 - No identifying patterns in traffic
+
+---
+
+# Protocol v2: Batched Tunnel (High Performance)
+
+## Overview
+
+Protocol v2 optimizes throughput by batching multiple requests, compressing with zstd, and optionally encoding as video for 25MB capacity.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  v1 Protocol (Current)                                                       │
+│  Request 1 → Google → Server → Response 1                                   │
+│  Request 2 → Google → Server → Response 2                                   │
+│  Request 3 → Google → Server → Response 3                                   │
+│  ... 10 round trips for 10 requests                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  v2 Protocol (Batched)                                                       │
+│  [Req1, Req2, Req3...] → Compress → Google → Server → [Resp1, Resp2, Resp3] │
+│  ... 1 round trip for 10 requests                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Performance Comparison
+
+| Metric | v1 (Current) | v2 (Batched) |
+|--------|--------------|--------------|
+| Round trips per 10 requests | 10 | 1 |
+| Latency | 10 × RTT | 1 × RTT + processing |
+| Compression | None | 70-90% smaller (zstd) |
+| Max payload | ~8 KB (text) | 25 MB (video) |
+| Effective bandwidth | 10-50 KB/s | 100-500 KB/s |
+
+## Data Structures
+
+### Batched Request (Client → Server)
+
+```rust
+// Rust
+#[derive(Serialize, Deserialize)]
+struct BatchedRequest {
+    version: u8,                    // Protocol version (2)
+    batch_id: u32,                  // For matching responses
+    compression: String,            // "zstd" or "none"
+    requests: Vec<TunnelRequest>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TunnelRequest {
+    stream_id: u16,                 // Unique ID to match response
+    method: String,                 // "GET", "POST", "CONNECT", etc.
+    host: String,                   // Target hostname
+    port: u16,                      // Target port
+    path: String,                   // URL path
+    headers: Vec<(String, String)>, // HTTP headers
+    body: Option<Vec<u8>>,          // Request body (POST/PUT)
+}
+```
+
+```kotlin
+// Kotlin (Android)
+@Serializable
+data class BatchedRequest(
+    val version: Int = 2,
+    val batchId: Long,
+    val compression: String = "zstd",
+    val requests: List<TunnelRequest>
+)
+
+@Serializable
+data class TunnelRequest(
+    val streamId: Int,
+    val method: String,
+    val host: String,
+    val port: Int,
+    val path: String,
+    val headers: List<Pair<String, String>>,
+    val body: ByteArray? = null
+)
+```
+
+### Batched Response (Server → Client)
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct BatchedResponse {
+    version: u8,
+    batch_id: u32,
+    compression: String,
+    responses: Vec<TunnelResponse>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TunnelResponse {
+    stream_id: u16,                 // Matches request stream_id
+    status: u16,                    // HTTP status code
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    error: Option<String>,          // Error message if failed
+}
+```
+
+## Batching Strategy
+
+### Client-Side Batching
+
+```kotlin
+class RequestBatcher {
+    private val pendingRequests = mutableListOf<TunnelRequest>()
+    private val responseHandlers = mutableMapOf<Int, CompletableDeferred<TunnelResponse>>()
+    private var nextStreamId = 0
+    private var batchTimer: Job? = null
+
+    // Configuration
+    private val BATCH_WINDOW_MS = 50L      // Collect requests for 50ms
+    private val MAX_BATCH_SIZE = 10        // Or until 10 requests queued
+    private val MAX_BATCH_BYTES = 1_000_000 // Or until 1MB payload
+
+    suspend fun submitRequest(request: TunnelRequest): TunnelResponse {
+        val streamId = nextStreamId++
+        val requestWithId = request.copy(streamId = streamId)
+        val deferred = CompletableDeferred<TunnelResponse>()
+
+        synchronized(this) {
+            pendingRequests.add(requestWithId)
+            responseHandlers[streamId] = deferred
+
+            // Start batch timer if first request
+            if (pendingRequests.size == 1) {
+                batchTimer = scope.launch {
+                    delay(BATCH_WINDOW_MS)
+                    flushBatch()
+                }
+            }
+
+            // Flush immediately if batch is full
+            if (shouldFlush()) {
+                batchTimer?.cancel()
+                flushBatch()
+            }
+        }
+
+        return deferred.await()
+    }
+
+    private fun shouldFlush(): Boolean {
+        return pendingRequests.size >= MAX_BATCH_SIZE ||
+               estimateBatchSize() >= MAX_BATCH_BYTES
+    }
+
+    private suspend fun flushBatch() {
+        val batch: List<TunnelRequest>
+        synchronized(this) {
+            batch = pendingRequests.toList()
+            pendingRequests.clear()
+        }
+
+        if (batch.isEmpty()) return
+
+        val batchedRequest = BatchedRequest(
+            batchId = System.currentTimeMillis().toInt(),
+            requests = batch
+        )
+
+        // Serialize, compress, encrypt, send
+        val response = sendBatchedRequest(batchedRequest)
+
+        // Dispatch responses to waiting handlers
+        response.responses.forEach { resp ->
+            responseHandlers[resp.streamId]?.complete(resp)
+            responseHandlers.remove(resp.streamId)
+        }
+    }
+}
+```
+
+### Server-Side Handling
+
+```python
+# Python server pseudocode
+async def handle_batched_request(encrypted_payload: bytes) -> bytes:
+    # 1. Decrypt
+    payload = decrypt(encrypted_payload)
+
+    # 2. Decompress
+    if payload.startswith(ZSTD_MAGIC):
+        payload = zstd.decompress(payload)
+
+    # 3. Parse batch
+    batch = json.loads(payload)
+
+    # 4. Execute all requests in parallel
+    tasks = []
+    for req in batch['requests']:
+        task = asyncio.create_task(execute_request(req))
+        tasks.append((req['stream_id'], task))
+
+    # 5. Collect responses
+    responses = []
+    for stream_id, task in tasks:
+        try:
+            result = await task
+            responses.append({
+                'stream_id': stream_id,
+                'status': result.status,
+                'headers': list(result.headers.items()),
+                'body': base64.b64encode(result.body).decode()
+            })
+        except Exception as e:
+            responses.append({
+                'stream_id': stream_id,
+                'status': 502,
+                'error': str(e)
+            })
+
+    # 6. Build response batch
+    response_batch = {
+        'version': 2,
+        'batch_id': batch['batch_id'],
+        'compression': 'zstd',
+        'responses': responses
+    }
+
+    # 7. Compress and encrypt
+    payload = json.dumps(response_batch).encode()
+    compressed = zstd.compress(payload)
+    encrypted = encrypt(compressed)
+
+    return encrypted
+```
+
+## Wire Format
+
+### Phase 1: Text Encoding (Current Google Docs text endpoint)
+
+```
+URL: /tunnel/{session_id}/batch/{base64url_payload}.txt
+
+Payload structure:
+┌─────────────────────────────────────────┐
+│ Encrypted (AES-256-GCM)                 │
+│ ┌─────────────────────────────────────┐ │
+│ │ Compressed (zstd)                   │ │
+│ │ ┌─────────────────────────────────┐ │ │
+│ │ │ JSON BatchedRequest             │ │ │
+│ │ │ {                               │ │ │
+│ │ │   "version": 2,                 │ │ │
+│ │ │   "batch_id": 12345,            │ │ │
+│ │ │   "requests": [...]             │ │ │
+│ │ │ }                               │ │ │
+│ │ └─────────────────────────────────┘ │ │
+│ └─────────────────────────────────────┘ │
+└─────────────────────────────────────────┘
+```
+
+### Phase 2: Video Encoding (Future - 25MB capacity)
+
+```
+URL: Google Docs Viewer video endpoint
+
+Payload embedded in:
+- MP4 metadata (moov atom)
+- WebM metadata
+- Or raw frames (steganography)
+
+Benefits:
+- 25MB max file size vs ~8KB text
+- Suitable for bulk transfers
+- Video is common Google Docs content
+```
+
+## Server Endpoints
+
+Add to existing server:
+
+```
+# Existing v1 endpoints (keep for compatibility)
+/tunnel/{session_id}/init.txt
+/tunnel/{session_id}/connect/{host}/{port}
+/tunnel/{session_id}/send/{data}.txt
+/tunnel/{session_id}/recv.txt
+
+# New v2 batched endpoint
+/tunnel/{session_id}/batch/{payload}.txt    # Text-encoded batch
+/tunnel/{session_id}/batch/video            # Video-encoded batch (Phase 2)
+```
+
+## Implementation Checklist
+
+### Client (Rust/Android)
+
+- [ ] Add `zstd` crate dependency
+- [ ] Implement `BatchedRequest` / `BatchedResponse` structs
+- [ ] Create `RequestBatcher` with timer-based flushing
+- [ ] Add batch endpoint to `GoogleDocsTunnel`
+- [ ] Multiplex responses back to correct streams
+- [ ] Fallback to v1 for single low-latency requests
+
+### Server (Rust)
+
+- [ ] Add `zstd` decompression
+- [ ] Parse `BatchedRequest` JSON
+- [ ] Execute requests in parallel with `tokio::spawn`
+- [ ] Aggregate responses into `BatchedResponse`
+- [ ] Compress and encrypt response
+- [ ] Add `/batch/` route
+
+## Migration Strategy
+
+1. **Server**: Deploy with both v1 and v2 endpoints
+2. **Client**: Use v2 for bulk requests, v1 for single requests
+3. **Detection**: Check `version` field in response
+
+```rust
+// Client can choose protocol based on request pattern
+fn choose_protocol(pending_requests: &[Request]) -> Protocol {
+    if pending_requests.len() == 1 && is_low_latency_request(&pending_requests[0]) {
+        Protocol::V1  // Single request, use direct path
+    } else {
+        Protocol::V2  // Multiple requests, use batching
+    }
+}
+```
+
+## Example: Batched Web Page Load
+
+Loading a web page typically requires 20-50 requests (HTML, CSS, JS, images).
+
+**v1 Protocol:**
+```
+50 requests × 300ms RTT = 15 seconds
+```
+
+**v2 Protocol:**
+```
+1 batch × 300ms RTT + 100ms processing = 400ms
+```
+
+**37x faster for web browsing!**

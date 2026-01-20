@@ -17,7 +17,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use snow::Builder;
 use std::{
     collections::HashMap,
@@ -306,6 +306,49 @@ impl TunnelResponse {
     }
 }
 
+// ============= BATCHED PROTOCOL v2 =============
+#[derive(Deserialize)]
+struct BatchedRequest {
+    #[serde(default)]
+    version: u8,
+    batch_id: u32,
+    #[serde(default)]
+    compression: String,
+    requests: Vec<BatchRequest>,
+}
+
+#[derive(Deserialize)]
+struct BatchRequest {
+    stream_id: u16,
+    method: String,
+    host: String,
+    port: u16,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    #[serde(default)]
+    body: Option<String>,  // Base64 encoded
+}
+
+#[derive(Serialize)]
+struct BatchedResponse {
+    version: u8,
+    batch_id: u32,
+    compression: String,
+    responses: Vec<BatchResponse>,
+}
+
+#[derive(Serialize)]
+struct BatchResponse {
+    stream_id: u16,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,  // Base64 encoded
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 // Text response for Google Docs Viewer
 fn text_response(resp: TunnelResponse) -> impl IntoResponse {
     (
@@ -589,6 +632,255 @@ async fn close_session(
     text_response(TunnelResponse::ok(&crypto, b"CLOSED"))
 }
 
+// ============= BATCHED HANDLER =============
+
+async fn handle_batch(
+    State(state): State<Arc<AppState>>,
+    Path((session_id, payload)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let short_id = &session_id[..8.min(session_id.len())];
+    info!("[{}] Batch request", short_id);
+
+    let crypto = match state.get_session_crypto(&session_id) {
+        Ok(c) => c,
+        Err(_) => return text_response(TunnelResponse::plain_error("INVALID_SESSION")),
+    };
+
+    // Decode and decrypt payload
+    let decrypted = match decode_url_data(&crypto, &payload) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("[{}] Batch decrypt failed: {}", short_id, e);
+            return text_response(TunnelResponse::plain_error("DECRYPT_FAILED"));
+        }
+    };
+
+    // Decompress if zstd
+    let decompressed = if decrypted.len() >= 4 && &decrypted[..4] == &[0x28, 0xB5, 0x2F, 0xFD] {
+        // zstd magic number
+        match zstd::decode_all(&decrypted[..]) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("[{}] Batch decompress failed: {}", short_id, e);
+                return text_response(TunnelResponse::error(&crypto, "DECOMPRESS_FAILED"));
+            }
+        }
+    } else {
+        decrypted
+    };
+
+    // Parse batched request
+    let batch: BatchedRequest = match serde_json::from_slice(&decompressed) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("[{}] Batch parse failed: {}", short_id, e);
+            return text_response(TunnelResponse::error(&crypto, "PARSE_FAILED"));
+        }
+    };
+
+    info!("[{}] Processing {} requests in batch {}", short_id, batch.requests.len(), batch.batch_id);
+
+    // Execute all requests in parallel
+    let mut handles = Vec::with_capacity(batch.requests.len());
+    for req in batch.requests {
+        let handle = tokio::spawn(async move {
+            execute_batch_request(req).await
+        });
+        handles.push(handle);
+    }
+
+    // Collect responses
+    let mut responses = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.await {
+            Ok(resp) => responses.push(resp),
+            Err(e) => {
+                responses.push(BatchResponse {
+                    stream_id: 0,
+                    status: 500,
+                    headers: vec![],
+                    body: String::new(),
+                    error: Some(format!("Task failed: {}", e)),
+                });
+            }
+        }
+    }
+
+    // Build response
+    let batch_response = BatchedResponse {
+        version: 2,
+        batch_id: batch.batch_id,
+        compression: "zstd".to_string(),
+        responses,
+    };
+
+    // Serialize and compress response
+    let json_bytes = serde_json::to_vec(&batch_response).unwrap_or_default();
+    let compressed = zstd::encode_all(&json_bytes[..], 3).unwrap_or(json_bytes);
+
+    // Encrypt
+    let encrypted = match crypto.encrypt(&compressed) {
+        Ok(e) => e,
+        Err(_) => return text_response(TunnelResponse::error(&crypto, "ENCRYPT_FAILED")),
+    };
+
+    info!("[{}] Batch {} complete: {} responses", short_id, batch.batch_id, batch_response.responses.len());
+
+    // Return as TunnelResponse with encrypted batch data
+    text_response(TunnelResponse {
+        status: "ok".to_string(),
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        data: encrypted,
+    })
+}
+
+async fn execute_batch_request(req: BatchRequest) -> BatchResponse {
+    use tokio::io::AsyncWriteExt;
+
+    let stream_id = req.stream_id;
+
+    // Connect to target
+    let addr = format!("{}:{}", req.host, req.port);
+    let mut socket = match timeout(SOCKET_TIMEOUT, TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return BatchResponse {
+                stream_id,
+                status: 502,
+                headers: vec![],
+                body: String::new(),
+                error: Some(format!("Connect failed: {}", e)),
+            };
+        }
+        Err(_) => {
+            return BatchResponse {
+                stream_id,
+                status: 504,
+                headers: vec![],
+                body: String::new(),
+                error: Some("Connect timeout".to_string()),
+            };
+        }
+    };
+
+    // Build HTTP request
+    let path = if req.path.is_empty() { "/" } else { &req.path };
+    let mut request = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", req.method, path, req.host);
+
+    for (key, value) in &req.headers {
+        request.push_str(&format!("{}: {}\r\n", key, value));
+    }
+
+    // Add body if present
+    if let Some(ref body_b64) = req.body {
+        if let Ok(body) = STANDARD.decode(body_b64) {
+            request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+            request.push_str("\r\n");
+            if let Err(e) = socket.write_all(request.as_bytes()).await {
+                return BatchResponse {
+                    stream_id,
+                    status: 502,
+                    headers: vec![],
+                    body: String::new(),
+                    error: Some(format!("Write failed: {}", e)),
+                };
+            }
+            if let Err(e) = socket.write_all(&body).await {
+                return BatchResponse {
+                    stream_id,
+                    status: 502,
+                    headers: vec![],
+                    body: String::new(),
+                    error: Some(format!("Write body failed: {}", e)),
+                };
+            }
+        }
+    } else {
+        request.push_str("Connection: close\r\n\r\n");
+        if let Err(e) = socket.write_all(request.as_bytes()).await {
+            return BatchResponse {
+                stream_id,
+                status: 502,
+                headers: vec![],
+                body: String::new(),
+                error: Some(format!("Write failed: {}", e)),
+            };
+        }
+    }
+
+    // Read response with timeout
+    let mut response_data = Vec::new();
+    let read_result = timeout(Duration::from_secs(30), async {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match socket.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => response_data.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+            if response_data.len() > 1_000_000 {
+                break; // Limit response size
+            }
+        }
+    }).await;
+
+    if read_result.is_err() {
+        return BatchResponse {
+            stream_id,
+            status: 504,
+            headers: vec![],
+            body: STANDARD.encode(&response_data),
+            error: Some("Read timeout".to_string()),
+        };
+    }
+
+    // Parse HTTP response
+    let response_str = String::from_utf8_lossy(&response_data);
+    let mut lines = response_str.lines();
+
+    // Parse status line
+    let status = if let Some(status_line) = lines.next() {
+        status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(502)
+    } else {
+        502
+    };
+
+    // Parse headers
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            headers.push((key.trim().to_string(), value.trim().to_string()));
+        }
+    }
+
+    // Extract body (everything after headers)
+    let body_start = response_data
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(response_data.len());
+
+    let body = STANDARD.encode(&response_data[body_start..]);
+
+    BatchResponse {
+        stream_id,
+        status,
+        headers,
+        body,
+        error: None,
+    }
+}
+
 // ============= HELPERS =============
 
 fn decode_url_data(crypto: &SessionCrypto, data: &str) -> Result<Vec<u8>> {
@@ -678,6 +970,7 @@ async fn main() -> Result<()> {
         .route("/tunnel/:session_id/send/:data.txt", get(send_data))
         .route("/tunnel/:session_id/recv.txt", get(recv_data))
         .route("/tunnel/:session_id/close.txt", get(close_session))
+        .route("/tunnel/:session_id/batch/:payload", get(handle_batch))
         .with_state(state);
 
     // Listen on all IPv6 (also accepts IPv4 on most systems via dual-stack)
