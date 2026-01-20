@@ -220,14 +220,38 @@ Contains the client's ephemeral public key + AEAD tag, allowing the server to de
 
 ## Performance
 
-| Metric | Value |
-|--------|-------|
-| Latency per request | 200-500ms |
-| Effective bandwidth | 10-50 KB/s |
-| Concurrent sessions | Thousands |
-| IPv6 addresses | 2^64 |
+**Measured (real-world testing):**
 
-Best suited for: messaging, web browsing, low-bandwidth applications.
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Google Docs RTT | ~500ms | Single viewer request |
+| Session init | ~500ms | 1 Google roundtrip |
+| TCP connect | ~500ms | 1 Google roundtrip |
+| Full HTTPS request | 5-7 sec | Init + connect + TLS + data |
+| Throughput | 1-5 KB/s | Limited by Google RTT |
+| Server IPv6 pool | 2^64 | Avoids server-side rate limits |
+
+**Rate Limiting:**
+- Google rate limits per client IP
+- ~10 requests/minute sustainable
+- Bursts trigger "No document ID" errors
+- 100ms minimum delay between requests helps
+
+**Best for:**
+- Telegram, Signal, WhatsApp messaging
+- Low-bandwidth web browsing
+- Email access
+- Text-based applications
+
+**Not suitable for:**
+- Video streaming
+- Large file downloads
+- Real-time gaming
+
+**Optimization (v2 batching):**
+- Batch multiple requests → 1 Google roundtrip
+- zstd compression → 70-90% smaller payloads
+- Can improve effective throughput 5-10x
 
 ## Troubleshooting
 
